@@ -121,6 +121,84 @@ def test_sequence_dispatches_all_when_fitting():
         db.close()
 
 
+def test_sequence_full_at_head_assigns_nothing_and_logs_nothing():
+    """队首就全部轿厢接不下：成功列表为空、无任何落库/回放、载荷不变。"""
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        b = Building(name="满员楼", floors=18)
+        db.add(b)
+        db.flush()
+        db.add_all([
+            ElevatorCar(building_id=b.id, label="F1", floor=1, direction="idle",
+                        load=10, capacity=10),
+            ElevatorCar(building_id=b.id, label="F2", floor=1, direction="idle",
+                        load=8, capacity=8),
+        ])
+        db.flush()
+        c1 = CallTicket(building_id=b.id, floor=5, direction="up",
+                        passengers=1, status="waiting")
+        c2 = CallTicket(building_id=b.id, floor=6, direction="up",
+                        passengers=1, status="waiting")
+        db.add_all([c1, c2])
+        db.commit()
+        bid, id1, id2 = b.id, c1.id, c2.id
+    finally:
+        db.close()
+
+    with TestClient(app) as client:
+        resp = client.post("/api/dispatch/sequence", json={"building_id": bid})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["assigned"] == []
+    assert data["stopped_call_id"] == id1
+    assert "接不下" in data["stop_reason"]
+
+    db = SessionLocal()
+    try:
+        for i in (id1, id2):
+            t = db.get(CallTicket, i)
+            # 停点及其后保持 waiting，不得变成 assigned
+            assert t.status == "waiting"
+            assert t.assigned_car_id is None
+            assert t.score == ""
+        # 全部轿厢维持原载荷，不超过容量
+        for car in db.query(ElevatorCar).all():
+            assert car.load <= car.capacity
+        # 没有任何成功笔 → 回放无新增日志
+        assert db.query(DispatchLog).count() == 0
+    finally:
+        db.close()
+
+
+def test_sequence_replay_matches_success_list_and_capacity_holds():
+    """成功列表与本次新增回放一一对应（无 NULL car）；载荷不超容量；拥堵只算 waiting。"""
+    bid, id1, id2, id3 = _setup_three_waiting_with_tight_capacity()
+    with TestClient(app) as client:
+        resp = client.post("/api/dispatch/sequence", json={"building_id": bid})
+        data = resp.json()
+        success_ids = [item["call_id"] for item in data["assigned"]]
+        assert success_ids == [id1]
+
+        replay = client.get("/api/replay").json()
+        replay_ids = [row["call_id"] for row in replay]
+        # 回放条数与派工页成功列表一致
+        assert replay_ids == success_ids
+        assert all(row["car_id"] is not None for row in replay)
+
+        cars = client.get("/api/cars").json()
+        # 拥堵（剩余容量矛盾的另一面）：任何轿厢载荷都不得超过容量
+        assert all(c["load"] <= c["capacity"] for c in cars)
+
+        congestion = client.get("/api/congestion").json()
+        cong_floors = {row["floor"] for row in congestion}
+        calls = client.get("/api/calls").json()
+        waiting_floors = {c["floor"] for c in calls if c["status"] == "waiting"}
+        # 拥堵页只统计 waiting：id1(5F) 已 assigned 不应出现；id2(6F)/id3(7F) 在
+        assert cong_floors == waiting_floors
+
+
 def test_sequence_empty_queue_is_ok():
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)

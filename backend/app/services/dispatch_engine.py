@@ -101,12 +101,10 @@ def dispatch_sequence(
     assignments: list[DispatchAssignment] = []
 
     for call in calls:
-        ranked = sorted(
-            (score_car(c, call) for c in states.values()),
-            key=lambda r: r.score,
-            reverse=True,
-        )
-        best = ranked[0] if ranked else None
+        # 与单笔派工同一口径：只在 accepted（未超容量）的轿厢里取评分最高者；
+        # 全部轿厢都接不下时 pick_car 返回 None，立即停止，不能取 rejected 的
+        # -1e9 兜底，否则停点会被派上并导致载荷超过容量。
+        best = pick_car(list(states.values()), call)
         if best is None:
             return SequenceDispatchResult(
                 tuple(assignments),
